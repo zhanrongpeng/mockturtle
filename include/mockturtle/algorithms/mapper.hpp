@@ -34,6 +34,9 @@
 
 #include <cstdint>
 #include <limits>
+#include <map>
+#include <fstream>
+#include <sstream>
 
 #include <fmt/format.h>
 
@@ -178,6 +181,171 @@ struct map_params
 
   /*! \brief The trade-off between power mode and performance mode. */
   double trade_off{0.0f};
+
+  /*! \brief Wire resistance per micron (ohm/um) for Elmore wire delay model. */
+  double wire_r_per_um{0.0};
+
+  /*! \brief Wire capacitance per micron (fF/um) for Elmore wire delay model. */
+  double wire_c_per_um{0.0};
+
+  /*! \brief Per-layer RC data parsed from OpenROAD setRC.tcl file.
+   *  Key: layer name (e.g. "M1", "M2", "signal"), Value: {resistance (ohm/um), capacitance (fF/um)}.
+   *  This is populated by calling read_layer_rc().
+   */
+  std::map<std::string, std::pair<double, double>> layer_rc;
+
+  /*! \brief Wire resistance for signal wires from set_wire_rc -signal (ohm/um).
+   *  Computed as the average of all metal layers weighted by their RC product.
+   */
+  double signal_resistance{0.0};
+
+  /*! \brief Wire capacitance for signal wires from set_wire_rc -signal (fF/um). */
+  double signal_capacitance{0.0};
+
+  /*! \brief Target metal layer name for Elmore wire delay RC.
+   *  If set, this layer's RC from the setRC.tcl will be used instead of set_wire_rc -signal.
+   *  Example: "M3" (corresponds to wire_rc_layer in OpenROAD vars).
+   *  If empty, falls back to set_wire_rc -signal, then weighted average.
+   */
+  std::string wire_rc_layer{""};
+
+  /*! \brief Read RC values from an OpenROAD setRC.tcl file.
+   *  Parses "set_layer_rc -layer <name> -resistance <R> -capacitance <C>"
+   *  and "set_wire_rc -signal -resistance <R> -capacitance <C>" directives.
+   *
+   *  Priority for setting wire_r_per_um and wire_c_per_um:
+   *    1. If wire_rc_layer is set and that layer exists in the file -> use that layer's RC
+   *    2. Else if set_wire_rc -signal was found -> use set_wire_rc -signal values
+   *    3. Else -> use RC-weighted average of all metal layers
+   *
+   *  @param filename  Path to the setRC.tcl file (e.g. OpenROAD/test/asap7/setRC.tcl)
+   *  @return true if file was read successfully, false otherwise
+   */
+  bool read_layer_rc(const std::string& filename) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+      std::cerr << "[ERROR] Cannot open layer RC file: " << filename << std::endl;
+      return false;
+    }
+
+    layer_rc.clear();
+    std::string line;
+    double total_rc_weight = 0.0;
+    double weighted_r = 0.0;
+    double weighted_c = 0.0;
+
+    while (std::getline(file, line)) {
+      // Strip comments
+      size_t comment_pos = line.find('#');
+      if (comment_pos != std::string::npos) {
+        line = line.substr(0, comment_pos);
+      }
+
+      std::istringstream iss(line);
+      std::string token;
+      iss >> token;
+
+      if (token == "set_layer_rc") {
+        std::string layer_name;
+        double resistance = 0.0;
+        double capacitance = 0.0;
+
+        while (iss >> token) {
+          if (token == "-layer" || token == "layer") {
+            iss >> layer_name;
+          } else if (token == "-resistance" || token == "resistance") {
+            iss >> resistance;
+          } else if (token == "-capacitance" || token == "capacitance") {
+            iss >> capacitance;
+          }
+        }
+
+        if (!layer_name.empty()) {
+          // Skip via entries (contain 'V' and no capacitance)
+          if (capacitance > 0.0) {
+            layer_rc[layer_name] = {resistance, capacitance};
+            double rc_product = resistance * capacitance;
+            weighted_r += resistance * rc_product;
+            weighted_c += capacitance * rc_product;
+            total_rc_weight += rc_product;
+          }
+        }
+      } else if (token == "set_wire_rc") {
+        // Next token is the wire type: "-signal" or "signal"
+        std::string wire_type_token;
+        double resistance = 0.0;
+        double capacitance = 0.0;
+
+        iss >> wire_type_token;
+        // The token may be "-signal" or just "signal"
+        bool is_signal = (wire_type_token == "-signal" || wire_type_token == "signal");
+
+        std::string opt;
+        while (iss >> opt) {
+          if (opt == "-resistance" || opt == "resistance") {
+            iss >> resistance;
+          } else if (opt == "-capacitance" || opt == "capacitance") {
+            iss >> capacitance;
+          }
+        }
+
+        if (is_signal) {
+          signal_resistance = resistance;
+          signal_capacitance = capacitance;
+        }
+      }
+    }
+
+    file.close();
+
+    // Set wire_r_per_um and wire_c_per_um with priority:
+    // 1. wire_rc_layer (if specified and exists in layer_rc)
+    // 2. set_wire_rc -signal (if found)
+    // 3. RC-weighted average of all metal layers (fallback)
+    bool rc_set = false;
+
+    // Priority 1: use wire_rc_layer if specified and found
+    if (!wire_rc_layer.empty()) {
+      auto it = layer_rc.find(wire_rc_layer);
+      if (it != layer_rc.end()) {
+        wire_r_per_um = it->second.first;
+        wire_c_per_um = it->second.second;
+        rc_set = true;
+        std::cout << "[INFO] Layer RC loaded from: " << filename << std::endl;
+        std::cout << "       Using layer '" << wire_rc_layer << "': "
+                  << "R=" << wire_r_per_um << " ohm/um, C=" << wire_c_per_um << " fF/um" << std::endl;
+      } else {
+        std::cerr << "[WARNING] Layer '" << wire_rc_layer
+                  << "' not found in RC file. Available layers: ";
+        for (auto& kv : layer_rc) std::cerr << kv.first << " ";
+        std::cerr << std::endl;
+      }
+    }
+
+    // Priority 2: use set_wire_rc -signal if found and not overridden
+    if (!rc_set && signal_resistance > 0.0 && signal_capacitance > 0.0) {
+      wire_r_per_um = signal_resistance;
+      wire_c_per_um = signal_capacitance;
+      std::cout << "[INFO] Layer RC loaded from: " << filename << std::endl;
+      std::cout << "       Using set_wire_rc -signal: R=" << signal_resistance
+                << " ohm/um, C=" << signal_capacitance << " fF/um" << std::endl;
+      rc_set = true;
+    }
+
+    // Priority 3: fallback to RC-weighted average
+    if (!rc_set && total_rc_weight > 0.0) {
+      wire_r_per_um = weighted_r / total_rc_weight;
+      wire_c_per_um = weighted_c / total_rc_weight;
+      std::cout << "[INFO] Layer RC loaded from: " << filename << std::endl;
+      std::cout << "       Computed effective Elmore RC (RC-weighted avg): "
+                << "R=" << wire_r_per_um << " ohm/um, C=" << wire_c_per_um << " fF/um" << std::endl;
+    } else if (!rc_set) {
+      std::cerr << "[WARNING] No valid RC data found in: " << filename << std::endl;
+      return false;
+    }
+
+    return true;
+  }
 };
 
 /*! \brief Statistics for mapper.
@@ -273,6 +441,8 @@ struct node_match_tech
   float flows[3];
   /* total wirelength */
   double total_wirelength[2];
+  /* total delay (cell delay + wire delay) at node output */
+  double total_delay[2];
   /* Position of clustered node */
   node_position match_position[2];
   /* total wirelength flow */
@@ -306,6 +476,22 @@ public:
     std::tie( lib_buf_area, lib_buf_delay, lib_buf_id ) = library.get_buffer_info();
   }
 
+  explicit tech_map_impl( Ntk const& ntk, tech_library<NInputs, Configuration> const& library, std::vector<node_position> const& np, map_params const& ps, map_stats& st )
+      : ntk( ntk ),
+        library( library ),
+        np( np ),
+        ps( ps ),
+        st( st ),
+        node_match( ntk.size() ),
+        matches(),
+        switch_activity( ps.eswp_rounds ? switching_activity( ntk, ps.switching_activity_patterns ) : std::vector<float>( 0 ) ),
+        cuts( fast_cut_enumeration<Ntk, CutSize, true, CutData>( ntk, ps.cut_enumeration_ps, &st.cut_enumeration_st ) ),
+        match_position( ntk.size() )
+  {
+    std::tie( lib_inv_area, lib_inv_delay, lib_inv_id ) = library.get_inverter_info();
+    std::tie( lib_buf_area, lib_buf_delay, lib_buf_id ) = library.get_buffer_info();
+  }
+
   explicit tech_map_impl( Ntk const& ntk, tech_library<NInputs, Configuration> const& library, std::vector<float> const& switch_activity, map_params const& ps, map_stats& st )
       : ntk( ntk ),
         library( library ),
@@ -319,22 +505,6 @@ public:
   {
     std::tie( lib_inv_area, lib_inv_delay, lib_inv_id ) = library.get_inverter_info();
     std::tie( lib_buf_area, lib_buf_delay, lib_buf_id ) = library.get_buffer_info();
-  }
-
-  explicit tech_map_impl(Ntk const& ntk, tech_library<NInputs, Configuration> const& library, std::vector<node_position> const& np, map_params const& ps, map_stats& st)
-      : ntk(ntk),
-        library(library),
-        np(np),
-        ps(ps),
-        st(st),
-        node_match(ntk.size()),
-        matches(),
-        switch_activity( ps.eswp_rounds ? switching_activity(ntk, ps.switching_activity_patterns) : std::vector<float>(0)),
-        cuts(fast_cut_enumeration<Ntk, CutSize, true, CutData>( ntk, ps.cut_enumeration_ps, &st.cut_enumeration_st)),
-        match_position(ntk.size()) 
-  {
-    std::tie(lib_inv_area, lib_inv_delay, lib_inv_id) = library.get_inverter_info();
-    std::tie(lib_buf_area, lib_buf_delay, lib_buf_id) = library.get_buffer_info();
   }
 
   map_ntk_t run()
@@ -569,6 +739,14 @@ protected:
       auto& node_data = node_match[index];
 
       node_data.est_refs[0] = node_data.est_refs[1] = node_data.est_refs[2] = static_cast<float>( ntk.fanout_size( n ) );
+
+      /* initialize position from np if available */
+      if ( !np.empty() )
+      {
+        match_position[index] = np[index];
+        node_data.wirelength[0] = node_data.wirelength[1] = 0.0;
+        node_data.total_wirelength[0] = node_data.total_wirelength[1] = 0.0;
+      }
 
       if ( ntk.is_constant( n ) )
       {
@@ -939,11 +1117,17 @@ protected:
     ntk.foreach_co( [this]( auto s ) {
       const auto index = ntk.node_to_index( ntk.get_node( s ) );
 
-      if (ntk.is_complemented(s)) {
-        delay = std::max(delay, node_match[index].arrival[1]);
-      } else {
-        delay = std::max(delay, node_match[index].arrival[0]);
+      /* use total_delay if positions are available, otherwise use arrival */
+      double node_delay;
+      if ( !np.empty() )
+      {
+        node_delay = ntk.is_complemented(s) ? node_match[index].total_delay[1] : node_match[index].total_delay[0];
       }
+      else
+      {
+        node_delay = ntk.is_complemented(s) ? node_match[index].arrival[1] : node_match[index].arrival[0];
+      }
+      delay = std::max(delay, node_delay);
 
       if constexpr ( !ELA )
       {
@@ -1384,6 +1568,8 @@ protected:
     double best_arrival = std::numeric_limits<double>::max();
     double best_area_flow = std::numeric_limits<double>::max();
     float best_area = std::numeric_limits<float>::max();
+    double best_wirelength = 0.0;
+    double best_total_delay = std::numeric_limits<double>::max();
     uint32_t best_size = UINT32_MAX;
     uint8_t best_cut = 0u;
     uint8_t best_phase = 0u;
@@ -1413,6 +1599,18 @@ protected:
         best_arrival = std::max( best_arrival, arrival_pin );
         ++ctr;
       }
+
+      /* compute wire delay if positions are available */
+      if ( !np.empty() && cut.size() > 1 )
+      {
+        node_position gate_position = compute_gate_position( cut );
+        best_wirelength = compute_match_wirelength( cut, gate_position, best_phase );
+        double wire_delay = wireDelayElmore( best_wirelength );
+        best_total_delay = best_arrival + wire_delay;
+        node_data.wirelength[phase] = best_wirelength;
+        node_data.total_delay[phase] = best_total_delay;
+        match_position[index] = gate_position;
+      }
     }
 
     /* foreach cut */
@@ -1434,6 +1632,13 @@ protected:
         continue;
       }
 
+      /* skip unit cuts for wire delay computation */
+      if ( !np.empty() && cut->size() <= 1 )
+      {
+        ++cut_index;
+        continue;
+      }
+
       /* match each gate and take the best one */
       for ( auto const& gate : *supergates[phase] )
       {
@@ -1450,13 +1655,25 @@ protected:
           ++ctr;
         }
 
+        double worst_wirelength = 0.0;
+        double worst_total_delay = worst_arrival;
+
+        /* compute wire delay if positions are available */
+        if ( !np.empty() )
+        {
+          node_position gate_position = compute_gate_position( *cut );
+          worst_wirelength = compute_match_wirelength( *cut, gate_position, gate_polarity );
+          double wire_delay = wireDelayElmore( worst_wirelength );
+          worst_total_delay = worst_arrival + wire_delay;
+        }
+
         if constexpr ( DO_AREA )
         {
-          if ( worst_arrival > node_data.required[phase] + epsilon )
+          if ( worst_total_delay > node_data.required[phase] + epsilon )
             continue;
         }
         
-        if ( compare_map<DO_AREA>( worst_arrival, best_arrival, area_local, best_area_flow, cut->size(), best_size ) )
+        if ( compare_map<DO_AREA>( worst_total_delay, best_total_delay, area_local, best_area_flow, cut->size(), best_size ) )
         {
           best_arrival = worst_arrival;
           best_area_flow = area_local;
@@ -1465,6 +1682,8 @@ protected:
           best_area = gate.area;
           best_phase = gate_polarity;
           best_supergate = &gate;
+          best_wirelength = worst_wirelength;
+          best_total_delay = worst_total_delay;
         }
       }
       
@@ -1477,6 +1696,8 @@ protected:
     node_data.best_cut[phase] = best_cut;
     node_data.phase[phase] = best_phase;
     node_data.best_supergate[phase] = best_supergate;
+    node_data.wirelength[phase] = best_wirelength;
+    node_data.total_delay[phase] = best_total_delay;
   }
 
   template<bool SwitchActivity>
@@ -2340,7 +2561,14 @@ protected:
         if ( !ntk.is_constant( n ) && ntk.is_ci( n ) && !ntk.is_complemented( f ) )
         {
           area += lib_buf_area;
-          delay = std::max( delay, node_match[ntk.node_to_index( n )].arrival[0] + lib_inv_delay );
+          /* use total_delay if positions are available, otherwise use arrival */
+          double node_delay;
+          auto idx = ntk.node_to_index( n );
+          if ( !np.empty() )
+            node_delay = node_match[idx].total_delay[0] + lib_inv_delay;
+          else
+            node_delay = node_match[idx].arrival[0] + lib_inv_delay;
+          delay = std::max( delay, node_delay );
           buffers = true;
         }
       } );
@@ -2562,46 +2790,17 @@ protected:
   }
 
   template<bool DO_AREA>
-  inline bool compare_map( double arrival, double best_arrival, double area_flow, double best_area_flow, uint32_t size, uint32_t best_size )
+  inline bool compare_map( double total_delay, double best_total_delay, double /*area_flow*/, double /*best_area_flow*/, uint32_t size, uint32_t best_size )
   {
-    if constexpr ( DO_AREA )
+    if ( total_delay < best_total_delay - epsilon )
     {
-      if ( area_flow < best_area_flow - epsilon )
-      {
-        return true;
-      }
-      else if ( area_flow > best_area_flow + epsilon )
-      {
-        return false;
-      }
-      else if ( arrival < best_arrival - epsilon )
-      {
-        return true;
-      }
-      else if ( arrival > best_arrival + epsilon )
-      {
-        return false;
-      }
+      return true;
     }
-    else
+    else if ( total_delay > best_total_delay + epsilon )
     {
-      if ( arrival < best_arrival - epsilon )
-      {
-        return true;
-      }
-      else if ( arrival > best_arrival + epsilon )
-      {
-        return false;
-      }
-      else if ( area_flow < best_area_flow - epsilon )
-      {
-        return true;
-      }
-      else if ( area_flow > best_area_flow + epsilon )
-      {
-        return false;
-      }
+      return false;
     }
+    /* total_delay 相等时，选 cut size 较小的 */
     if ( size < best_size )
     {
       return true;
@@ -2771,6 +2970,13 @@ protected:
     double distance = std::abs(roots.x_coordinate - leafs.x_coordinate) +
                       std::abs(roots.y_coordinate - leafs.y_coordinate);
     return distance;
+  }
+
+  // Elmore wire delay model: wire_delay = R * C * L^2 / 2 * 1e-3
+  // R: ohm/um, C: fF/um, L: um → result: ps
+  double wireDelayElmore(double wire_length_um) const {
+    return ps.wire_r_per_um * ps.wire_c_per_um
+           * wire_length_um * wire_length_um * 0.5 * 1e-3;
   }
 
   double weight_w_d(double wirelength_t, double total_wirelength_t, double delay_t) {
