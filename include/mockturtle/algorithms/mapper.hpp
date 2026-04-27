@@ -203,6 +203,14 @@ struct map_params
    *  Only applies when USE_TOTAL_DELAY=true in compute_mapping_exact.
    */
   double delay_tradeoff_weight{0.0};
+
+  /*! \brief Wire delay scaling coefficient for Elmore model.
+   *  Range: 0.0 to 1.0 (default: 1.0)
+   *  1.0 = full Elmore wire delay (original behavior)
+   *  0.0 = no wire delay, cell delay only
+   *  0.1 ~ 0.5 = reduced wire delay influence, cell delay has more weight in cut selection
+   */
+  double wire_delay_coefficient{1.0};
 };
 
 /*! \brief Statistics for mapper.
@@ -690,13 +698,18 @@ protected:
         auto ctr = 0u;
         auto best_cut = cuts.cuts(index)[node_data.best_cut[use_phase]];
         auto const& supergate = node_data.best_supergate[use_phase];
-        double td_parent = (!np.empty()) ? node_data.total_delay[use_phase] : node_data.arrival[use_phase];
         for (auto leaf : best_cut) {
           auto phase = (node_data.phase[use_phase] >> ctr) & 1;
-          double td_leaf = (!np.empty()) ? node_match[leaf].total_delay[phase] : node_match[leaf].arrival[phase];
+          double leaf_wire_delay = 0.0;
+          if (!np.empty()) {
+            double direct_distance =
+                std::abs(match_position[index].x_coordinate - match_position[leaf].x_coordinate) +
+                std::abs(match_position[index].y_coordinate - match_position[leaf].y_coordinate);
+            leaf_wire_delay = wireDelayElmore(direct_distance);
+          }
           node_match[leaf].required[phase] = std::min(
               node_match[leaf].required[phase],
-              td_parent - supergate->tdelay[ctr] - (td_leaf - node_match[leaf].arrival[phase]));
+              node_data.required[use_phase] - supergate->tdelay[ctr] - leaf_wire_delay);
           ++ctr;
         }
       }
@@ -705,13 +718,20 @@ protected:
         auto ctr = 0u;
         auto best_cut = cuts.cuts(index)[node_data.best_cut[other_phase]];
         auto const& supergate = node_data.best_supergate[other_phase];
-        double td_parent = (!np.empty()) ? node_data.total_delay[other_phase] : node_data.arrival[other_phase];
         for (auto leaf : best_cut) {
           auto phase = (node_data.phase[other_phase] >> ctr) & 1;
-          double td_leaf = (!np.empty()) ? node_match[leaf].total_delay[phase] : node_match[leaf].arrival[phase];
+          double leaf_wire_delay;
+          if (!np.empty()) {
+            double direct_distance =
+                std::abs(match_position[index].x_coordinate - match_position[leaf].x_coordinate) +
+                std::abs(match_position[index].y_coordinate - match_position[leaf].y_coordinate);
+            leaf_wire_delay = wireDelayElmore(direct_distance);
+          } else {
+            leaf_wire_delay = wireDelayElmore(node_match[leaf].wirelength[phase]);
+          }
           node_match[leaf].required[phase] = std::min(
               node_match[leaf].required[phase],
-              td_parent - supergate->tdelay[ctr] - (td_leaf - node_match[leaf].arrival[phase]));
+              node_data.required[other_phase] - supergate->tdelay[ctr] - leaf_wire_delay);
           ++ctr;
         }
       }
@@ -1597,7 +1617,15 @@ protected:
         for ( auto leaf : best_cut )
         {
           auto phase = ( node_data.phase[use_phase] >> ctr ) & 1;
-          double leaf_wire_delay = wireDelayElmore(node_match[leaf].wirelength[phase]);
+          double leaf_wire_delay;
+          if (!np.empty()) {
+            double direct_distance =
+                std::abs(match_position[index].x_coordinate - match_position[leaf].x_coordinate) +
+                std::abs(match_position[index].y_coordinate - match_position[leaf].y_coordinate);
+            leaf_wire_delay = wireDelayElmore(direct_distance);
+          } else {
+            leaf_wire_delay = wireDelayElmore(node_match[leaf].wirelength[phase]);
+          }
           node_match[leaf].required[phase] = std::min( node_match[leaf].required[phase], node_data.required[use_phase] - supergate->tdelay[ctr] - leaf_wire_delay );
           ++ctr;
         }
@@ -1611,7 +1639,15 @@ protected:
         for ( auto leaf : best_cut )
         {
           auto phase = ( node_data.phase[other_phase] >> ctr ) & 1;
-          double leaf_wire_delay = wireDelayElmore(node_match[leaf].wirelength[phase]);
+          double leaf_wire_delay;
+          if (!np.empty()) {
+            double direct_distance =
+                std::abs(match_position[index].x_coordinate - match_position[leaf].x_coordinate) +
+                std::abs(match_position[index].y_coordinate - match_position[leaf].y_coordinate);
+            leaf_wire_delay = wireDelayElmore(direct_distance);
+          } else {
+            leaf_wire_delay = wireDelayElmore(node_match[leaf].wirelength[phase]);
+          }
           node_match[leaf].required[phase] = std::min( node_match[leaf].required[phase], node_data.required[other_phase] - supergate->tdelay[ctr] - leaf_wire_delay );
           ++ctr;
         }
@@ -3280,11 +3316,8 @@ protected:
     return distance;
   }
 
-  // Elmore wire delay model: wire_delay = R * C * L^2 / 2 * 1e-3
-  // R: ohm/um, C: fF/um, L: um → result: ps
-  // Uses averaged RC from set_wire_rc -signal (or RC-weighted average of all layers)
   double wireDelayElmore(double wire_length_um) const {
-    return ps.wire_r_per_um * ps.wire_c_per_um
+    return ps.wire_delay_coefficient * ps.wire_r_per_um * ps.wire_c_per_um
            * wire_length_um * wire_length_um * 0.5 * 1e-3;
   }
 
@@ -4227,7 +4260,7 @@ protected:
         node_match[index].required[0] = required;
     } );
 
-    /* propagate required time to the PIs using total_delay (cell + wire) */
+    /* propagate required time to the PIs */
     auto i = ntk.size();
     while ( i-- > 0u )
     {
@@ -4261,8 +4294,7 @@ protected:
         for ( auto leaf : best_cut )
         {
           auto phase = ( node_data.phase[use_phase] >> match.permutation[ctr] ) & 1;
-          double leaf_wire_delay = wireDelayElmore(node_match[leaf].wirelength[phase]);
-          node_match[leaf].required[phase] = std::min( node_match[leaf].required[phase], (float)(node_data.required[use_phase] - supergate->tdelay[match.permutation[ctr]] - leaf_wire_delay) );
+          node_match[leaf].required[phase] = std::min( node_match[leaf].required[phase], node_data.required[use_phase] - supergate->tdelay[match.permutation[ctr]] );
           ctr++;
         }
       }
@@ -4276,8 +4308,7 @@ protected:
         for ( auto leaf : best_cut )
         {
           auto phase = ( node_data.phase[other_phase] >> match.permutation[ctr] ) & 1;
-          double leaf_wire_delay = wireDelayElmore(node_match[leaf].wirelength[phase]);
-          node_match[leaf].required[phase] = std::min( node_match[leaf].required[phase], (float)(node_data.required[other_phase] - supergate->tdelay[match.permutation[ctr]] - leaf_wire_delay) );
+          node_match[leaf].required[phase] = std::min( node_match[leaf].required[phase], node_data.required[other_phase] - supergate->tdelay[match.permutation[ctr]] );
           ctr++;
         }
       }
